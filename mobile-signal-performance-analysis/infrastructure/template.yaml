@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Mobile Signal Performance Analysis and Optimization - core infrastructure
+  (Kinesis Data Stream, Firehose delivery to S3, Lambda alarm function,
+  SNS topic for alerts). Redshift and Tableau connections are configured
+  separately as they require network/VPC and licensing details specific
+  to each deployment.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to subscribe to the signal-quality alert SNS topic.
+  StreamShardCount:
+    Type: Number
+    Default: 2
+    Description: Number of shards for the ingest Kinesis stream.
+
+Resources:
+
+  ## ---- Ingestion ----
+  SignalDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: mobile-signal-stream
+      ShardCount: !Ref StreamShardCount
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+
+  ## ---- Alerting ----
+  SignalAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: mobile-signal-alerts
+
+  SignalAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SignalAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlarmLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishToAlertTopic
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SignalAlertTopic
+
+  AlarmLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: mobile-signal-alarm-notification
+      Runtime: python3.12
+      Handler: alarm_notification.lambda_handler
+      Role: !GetAtt AlarmLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SignalAlertTopic
+          LATENCY_THRESHOLD_MS: "150"
+          PACKET_LOSS_THRESHOLD_PCT: "3"
+          THROUGHPUT_MIN_MBPS: "5"
+      Code:
+        # Placeholder inline code; replace with an S3 reference to the
+        # packaged lambda/alarm_notification.py in your deploy pipeline,
+        # e.g. via `sam package` / `aws cloudformation package`.
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"status": "placeholder - deploy real package"}
+
+  AlarmEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SignalDataStream.Arn
+      FunctionName: !GetAtt AlarmLambdaFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+
+  ## ---- Storage / Delivery ----
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "mobile-signal-raw-${AWS::AccountId}-${AWS::Region}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveAfter90Days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseToS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt SignalDataStream.Arn
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: mobile-signal-firehose
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt SignalDataStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt RawDataBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        Prefix: "raw/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CompressionFormat: GZIP
+
+Outputs:
+  StreamName:
+    Value: !Ref SignalDataStream
+  AlertTopicArn:
+    Value: !Ref SignalAlertTopic
+  RawDataBucketName:
+    Value: !Ref RawDataBucket
+  DeliveryStreamName:
+    Value: !Ref DeliveryStream
