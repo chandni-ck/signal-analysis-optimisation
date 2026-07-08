@@ -6,8 +6,7 @@ network performance metrics — **latency, throughput, packet loss, speed,
 range, and network drops** — to help network providers identify and resolve
 signal quality issues geographically and proactively.
 
-> Originating project report: *Work Placement and Professional Practice —
-> Final Project Report* (Chandni Chandrasekharan Kalathilparambil)
+
 
 ## Architecture
 
